@@ -1,0 +1,61 @@
+#
+# Copyright (c) 2026 Telink Semiconductor
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+config ST25DV
+	bool "ST25DV tags support"
+	select I2C
+	select GPIO
+	depends on DT_HAS_ST25DV_ENABLED
+	help
+		This option sets ST25DV tags support.
+
+if ST25DV
+
+choice
+	prompt "ST25DV log level"
+config ST25DV_LOG_LEVEL_ERR
+	bool "Error"
+config ST25DV_LOG_LEVEL_WRN
+	bool "Warning"
+config ST25DV_LOG_LEVEL_INF
+	bool "Information"
+config ST25DV_LOG_LEVEL_DBG
+	bool "Debug"
+endchoice
+
+config ST25DV_LOG_LEVEL
+	int
+	default 1 if ST25DV_LOG_LEVEL_ERR
+	default 2 if ST25DV_LOG_LEVEL_WRN
+	default 3 if ST25DV_LOG_LEVEL_INF
+	default 4 if ST25DV_LOG_LEVEL_DBG
+	default 0
+
+config ST25DV_MULTITHREAD_SUPPORT
+	bool "ST25DV multithread support"
+	default y
+	help
+		This option sets ST25DV multithread support.
+
+config ST25DV_WORKER_INIT_PRIO
+	int "ST25DV reception worker init priority"
+	default 70
+	help
+		This option sets ST25DV reception worker init priority.
+
+config ST25DV_WORKER_PRIORITY
+	int "ST25DV reception worker priority"
+	default 0
+	help
+		This option sets ST25DV reception worker priority.
+
+config ST25DV_WORKER_STACK_SIZE
+	int "ST25DV reception worker stack size"
+	default 2048
+	help
+		This option sets ST25DV reception worker stack size.
+
+endif # ST25DV
