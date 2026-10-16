@@ -17,8 +17,9 @@ LOG_MODULE_REGISTER(MODULE_NAME, CONFIG_ST25DV_LOG_LEVEL);
 
 #define ST25DV_USER_MEMORY_ADDR     0x53
 #define ST25DV_SYSTEM_AREA_ADDR     0x57
-#define ST25DV_FLASH_UPDATE_TIME_MS 30
-#define ST25DV_MBOX_LENGTH_MAX      255
+#define ST25DV_FLASH_UPDATE_TIME_MS 10
+#define ST25DV_FLASH_BLOCK_SIZE     16
+#define ST25DV_MBOX_LENGTH_MAX      256
 
 #define ST25DV_REG_SYS_GPO_1        0x0000
 #define ST25DV_REG_SYS_GPO_2        0x0001
@@ -396,7 +397,7 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 				LOG_ERR("%s write tag failed %d", st25dv_module_name, result);
 				break;
 			}
-			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS);
+			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS * 128 / ST25DV_FLASH_BLOCK_SIZE);
 			header_len = 0;
 			buf_len -= wr_len;
 			buf = (uint8_t *)buf + wr_len;
@@ -428,15 +429,63 @@ int st25dv_type5_tag_rm(struct st25dv_data *data)
 			break;
 		}
 
-		uint8_t erase_buff[2 + 8] = {0x00};
+		uint8_t header_len;
 
-		result = i2c_write(data->i2c_bus, erase_buff, sizeof(erase_buff),
-				   ST25DV_USER_MEMORY_ADDR);
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						0x00,
+						0x02,
+					},
+					2, /* zero 8 bytes CC , nonzero 8 bytes CC */
+					&header_len, sizeof(header_len));
 		if (result) {
-			LOG_ERR("%s erase tag failed %d", st25dv_module_name, result);
+			LOG_ERR("%s read cc length failed %d", st25dv_module_name, result);
 			break;
 		}
-		k_msleep(ST25DV_FLASH_UPDATE_TIME_MS);
+		header_len = !header_len ? 8 : 4;
+
+		union {
+			uint8_t data[3];
+			uint16_t length;
+		} tag_len;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						0x00,
+						header_len + 1,
+					},
+					2, /* tlv starts at cc length, so tlv length at offset 1 */
+					tag_len.data, sizeof(tag_len.data));
+		if (result) {
+			LOG_ERR("%s read tag length failed %d", st25dv_module_name, result);
+			break;
+		}
+		header_len += tag_len.data[0] == 0xff ? 4 : 2; /* tag and length */
+		tag_len.length = tag_len.data[0] == 0xff
+					 ? ((uint16_t)(tag_len.data[1] << 8) | tag_len.data[2])
+					 : tag_len.data[0];
+
+		uint16_t addr = 0;
+
+		while (addr < (uint16_t)header_len + tag_len.length) {
+
+			uint8_t wr_buff[2 + 128];
+
+			wr_buff[0] = (uint8_t)(addr >> 8);
+			wr_buff[1] = (uint8_t)addr;
+			memset(&wr_buff[2], 0x00, 128);
+			result = i2c_write(data->i2c_bus, wr_buff, sizeof(wr_buff),
+					   ST25DV_USER_MEMORY_ADDR);
+			if (result) {
+				LOG_ERR("%s erase tag failed %d", st25dv_module_name, result);
+				break;
+			}
+			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS * 128 / ST25DV_FLASH_BLOCK_SIZE);
+			addr += 128;
+		}
+		if (result) {
+			break;
+		}
 		LOG_DBG("%s tag erase ok", st25dv_module_name);
 	} while (0);
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
