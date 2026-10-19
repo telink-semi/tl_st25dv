@@ -52,5 +52,6 @@ void st25dv_set_callbacks(struct st25dv_data *data, st25dv_on_data_sent tx_cb,
 			  st25dv_on_data_received rx_cb);
 int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_len);
 int st25dv_type5_tag_rm(struct st25dv_data *data);
+int st25dv_type5_tag_enable(struct st25dv_data *data, bool enable);
 
 #endif /* ST25DV_H */
