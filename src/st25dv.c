@@ -23,6 +23,7 @@ LOG_MODULE_REGISTER(MODULE_NAME, CONFIG_ST25DV_LOG_LEVEL);
 
 #define ST25DV_REG_SYS_GPO_1        0x0000
 #define ST25DV_REG_SYS_GPO_2        0x0001
+#define ST25DV_REG_SYS_RF_MNGT      0x0003
 #define ST25DV_REG_SYS_MB_MODE      0x000d
 #define ST25DV_REG_SYS_MEM_SIZE_LSB 0x0014
 #define ST25DV_REG_SYS_MEM_SIZE_MSB 0x0015
@@ -30,6 +31,7 @@ LOG_MODULE_REGISTER(MODULE_NAME, CONFIG_ST25DV_LOG_LEVEL);
 #define ST25DV_REG_SYS_IC_REV       0x0020
 #define ST25DV_REG_SYS_I2C_PWD      0x0900
 #define ST25DV_REG_USR_GPO_DYN      0x2000
+#define ST25DV_REG_USR_RF_MNGT_DYN  0x2003
 #define ST25DV_REG_USR_SSM_ST_DYN   0x2004
 #define ST25DV_REG_USR_IT_STS_DYN   0x2005
 #define ST25DV_REG_USR_MB_CTRL_DYN  0x2006
@@ -478,6 +480,50 @@ int st25dv_type5_tag_rm(struct st25dv_data *data)
 	return result;
 }
 
+int st25dv_type5_tag_enable(struct st25dv_data *data, bool enable)
+{
+	int result = -ENODEV;
+
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_lock(&data->protector, K_FOREVER);)
+	)
+	do {
+		LOG_DBG("%s %s", st25dv_module_name, __func__);
+		if (data->inited) {
+			LOG_ERR("%s mailbox mode active", st25dv_module_name);
+			break;
+		}
+		if (!device_is_ready(data->i2c_bus)) {
+			LOG_ERR("%s device %s not ready", st25dv_module_name, data->i2c_bus->name);
+			break;
+		}
+		result = st25dv_probe_internal(data);
+		if (result) {
+			LOG_ERR("%s not detected on i2c bus %d", st25dv_module_name, result);
+			break;
+		}
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					   enable ? 0x00 : 0x02, /* bit 0: RF_DISABLE = 1
+								  * bit 1: RF_SLEEP = 1,
+								  * bit 2: RF_OFF = 1
+								  */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s reset radio state failed %d", st25dv_module_name, result);
+			break;
+		}
+		LOG_DBG("%s tag %s", st25dv_module_name, enable ? "enabled" : "disabled");
+	} while (0);
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_unlock(&data->protector);)
+	)
+	return result;
+}
+
 static inline int st25dv_probe_internal(struct st25dv_data *data)
 {
 	int result;
@@ -618,8 +664,8 @@ static inline int st25dv_update_registers(struct st25dv_data *data)
 					   (uint8_t)ST25DV_REG_SYS_GPO_1,
 					   0x61,
 					   /* bit 0: GPO_EN = 1,
-					    * bit 5: RF_PUT_MSG_EN = 1
-					    * bit 6: RF_GET_MSG_EN = 1
+					    * bit 5: RF_PUT_MSG_EN = 1,
+					    * bit 6: RF_GET_MSG_EN = 1,
 					    */
 				   },
 				   3, ST25DV_SYSTEM_AREA_ADDR);
@@ -695,6 +741,38 @@ static inline int st25dv_update_registers(struct st25dv_data *data)
 		break;
 	};
 
+	while (!result) {
+		uint8_t rf_state;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_SYSTEM_AREA_ADDR,
+					(uint8_t[]){
+						(uint8_t)(ST25DV_REG_SYS_RF_MNGT >> 8),
+						(uint8_t)ST25DV_REG_SYS_RF_MNGT,
+					},
+					2, &rf_state, sizeof(rf_state));
+		if (result) {
+			LOG_ERR("%s radio state read failed %d", st25dv_module_name, result);
+			break;
+		}
+		if (!rf_state) { /* bit 0: RF_DISABLE = 1, bit 1: RF_SLEEP = 1 */
+			LOG_DBG("%s radio state already set", st25dv_module_name);
+			break;
+		}
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_SYS_RF_MNGT >> 8),
+					   (uint8_t)ST25DV_REG_SYS_RF_MNGT,
+					   0x00, /* bit 0: RF_DISABLE = 1, bit 1: RF_SLEEP = 1 */
+				   },
+				   3, ST25DV_SYSTEM_AREA_ADDR);
+		if (result) {
+			LOG_ERR("%s radio state set failed %d", st25dv_module_name, result);
+			break;
+		}
+		k_msleep(ST25DV_FLASH_UPDATE_TIME_MS);
+		break;
+	};
+
 	return result;
 }
 
@@ -704,6 +782,20 @@ static inline int st25dv_reset(struct st25dv_data *data)
 
 	do {
 		LOG_DBG("%s %s", st25dv_module_name, __func__);
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					   0x00, /* bit 0: RF_DISABLE = 1
+						  * bit 1: RF_SLEEP = 1,
+						  * bit 2: RF_OFF = 1
+						  */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s reset radio state failed %d", st25dv_module_name, result);
+			break;
+		}
 		result = i2c_write(data->i2c_bus,
 				   (uint8_t[]){
 					   (uint8_t)(ST25DV_REG_USR_GPO_DYN >> 8),
