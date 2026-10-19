@@ -42,12 +42,12 @@ static const uint8_t st25dv_chip_ref[] = {0x51, 0x50};
 static struct k_work_q st25dv_workq;
 
 static inline int st25dv_probe_internal(struct st25dv_data *data);
-static inline int st25dv_get_mem_size(struct st25dv_data *data);
 static inline int st25dv_unlock_internal(struct st25dv_data *data, const uint8_t pass[8]);
 static inline int st25dv_is_locked(struct st25dv_data *data);
 static inline int st25dv_update_registers(struct st25dv_data *data);
 static inline int st25dv_reset(struct st25dv_data *data);
-static inline int st25dv_type5_tag_precondition(struct st25dv_data *data);
+static inline int st25dv_type5_tag_precondition(struct st25dv_data *data, size_t *mem_len,
+						size_t *tag_len);
 static void st25dv_isr_handler(const struct device *port, struct gpio_callback *cb,
 			       gpio_port_pins_t pins);
 static void st25dv_work_handler(struct k_work *item);
@@ -326,14 +326,12 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 			LOG_ERR("%s invalid data send", st25dv_module_name);
 			break;
 		}
-		result = st25dv_type5_tag_precondition(data);
+
+		size_t mem_size, tag_size;
+
+		result = st25dv_type5_tag_precondition(data, &mem_size, &tag_size);
 		if (result) {
 			LOG_ERR("%s tag preconditions failed %d", st25dv_module_name, result);
-			break;
-		}
-		result = st25dv_get_mem_size(data);
-		if (result < 0) {
-			LOG_ERR("%s get memory size failed %d", st25dv_module_name, result);
 			break;
 		}
 
@@ -341,21 +339,21 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 		size_t header_len;
 
 		if (result > 2044) {
-			header[0] = 0xe2;                               /* magic number           */
-			header[1] = 0x40;                               /* version & access cond. */
-			header[2] = 0x00;                               /* zero                   */
-			header[3] = 0x09;                               /* add feature info       */
-			header[4] = 0x00;                               /* rfu                    */
-			header[5] = 0x00;                               /* rfu                    */
-			header[6] = (uint8_t)((result - 8) >> (3 + 8)); /* mlen msb               */
-			header[7] = (uint8_t)((result - 8) >> 3);       /* mlen lsb               */
+			header[0] = 0xe2;                                 /* magic number     */
+			header[1] = 0x40;                                 /* version & access */
+			header[2] = 0x00;                                 /* zero             */
+			header[3] = 0x09;                                 /* add feature info */
+			header[4] = 0x00;                                 /* rfu              */
+			header[5] = 0x00;                                 /* rfu              */
+			header[6] = (uint8_t)((mem_size - 8) >> (3 + 8)); /* mlen msb         */
+			header[7] = (uint8_t)((mem_size - 8) >> 3);       /* mlen lsb         */
 			header_len = 8;
 
 		} else {
-			header[0] = 0xe1;                         /* magic number           */
-			header[1] = 0x40;                         /* version & access cond. */
-			header[2] = (uint8_t)((result - 4) >> 3); /* mlen                   */
-			header[3] = 0x09;                         /* add feature info       */
+			header[0] = 0xe1;                           /* magic number     */
+			header[1] = 0x40;                           /* version & access */
+			header[2] = (uint8_t)((mem_size - 4) >> 3); /* mlen             */
+			header[3] = 0x09;                           /* add feature info */
 			header_len = 4;
 		}
 		if (buf_len < 0xff) {
@@ -369,14 +367,14 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 			header[header_len + 3] = (uint8_t)buf_len;
 			header_len += 4;
 		}
-		if (header_len + buf_len > result) {
-			LOG_ERR("%s tag data size %u overflow", st25dv_module_name,
-				header_len + buf_len);
+		if (header_len + buf_len > mem_size) {
+			LOG_ERR("%s tag data size %u overflow, available %u", st25dv_module_name,
+				header_len + buf_len, mem_size);
 			result = -ENOMEM;
 			break;
 		}
 
-		uint16_t addr = 0;
+		size_t addr = 0;
 
 		while (buf_len) {
 
@@ -406,6 +404,25 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 		if (result) {
 			break;
 		}
+		while (addr < tag_size) {
+
+			uint8_t wr_buff[2 + 128];
+
+			wr_buff[0] = (uint8_t)(addr >> 8);
+			wr_buff[1] = (uint8_t)addr;
+			memset(&wr_buff[2], 0x00, 128);
+			result = i2c_write(data->i2c_bus, wr_buff, sizeof(wr_buff),
+					   ST25DV_USER_MEMORY_ADDR);
+			if (result) {
+				LOG_ERR("%s erase tag failed %d", st25dv_module_name, result);
+				break;
+			}
+			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS * 128 / ST25DV_FLASH_BLOCK_SIZE);
+			addr += 128;
+		}
+		if (result) {
+			break;
+		}
 		LOG_DBG("%s tag wtite ok", st25dv_module_name);
 	} while (0);
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
@@ -423,51 +440,18 @@ int st25dv_type5_tag_rm(struct st25dv_data *data)
 	)
 	do {
 		LOG_DBG("%s %s", st25dv_module_name, __func__);
-		result = st25dv_type5_tag_precondition(data);
+
+		size_t mem_size, tag_size;
+
+		result = st25dv_type5_tag_precondition(data, &mem_size, &tag_size);
 		if (result) {
 			LOG_ERR("%s tag preconditions failed %d", st25dv_module_name, result);
 			break;
 		}
 
-		uint8_t header_len;
+		size_t addr = 0;
 
-		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
-					(uint8_t[]){
-						0x00,
-						0x02,
-					},
-					2, /* zero 8 bytes CC , nonzero 8 bytes CC */
-					&header_len, sizeof(header_len));
-		if (result) {
-			LOG_ERR("%s read cc length failed %d", st25dv_module_name, result);
-			break;
-		}
-		header_len = !header_len ? 8 : 4;
-
-		union {
-			uint8_t data[3];
-			uint16_t length;
-		} tag_len;
-
-		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
-					(uint8_t[]){
-						0x00,
-						header_len + 1,
-					},
-					2, /* tlv starts at cc length, so tlv length at offset 1 */
-					tag_len.data, sizeof(tag_len.data));
-		if (result) {
-			LOG_ERR("%s read tag length failed %d", st25dv_module_name, result);
-			break;
-		}
-		header_len += tag_len.data[0] == 0xff ? 4 : 2; /* tag and length */
-		tag_len.length = tag_len.data[0] == 0xff
-					 ? ((uint16_t)(tag_len.data[1] << 8) | tag_len.data[2])
-					 : tag_len.data[0];
-
-		uint16_t addr = 0;
-
-		while (addr < (uint16_t)header_len + tag_len.length) {
+		while (addr < tag_size) {
 
 			uint8_t wr_buff[2 + 128];
 
@@ -535,42 +519,6 @@ static inline int st25dv_probe_internal(struct st25dv_data *data)
 			break;
 		}
 		LOG_INF("%s chip id %02x rev %02x", st25dv_module_name, chip_ref, chip_rev);
-	} while (0);
-
-	return result;
-}
-
-static inline int st25dv_get_mem_size(struct st25dv_data *data)
-{
-	int result;
-
-	do {
-		LOG_DBG("%s %s", st25dv_module_name, __func__);
-
-		uint8_t mem_size_lsb, mem_size_msb;
-
-		result = i2c_write_read(data->i2c_bus, ST25DV_SYSTEM_AREA_ADDR,
-					(uint8_t[]){
-						(uint8_t)(ST25DV_REG_SYS_MEM_SIZE_LSB >> 8),
-						(uint8_t)ST25DV_REG_SYS_MEM_SIZE_LSB,
-					},
-					2, &mem_size_lsb, sizeof(mem_size_lsb));
-		if (result) {
-			LOG_ERR("%s read memory size lsb failed %d", st25dv_module_name, result);
-			break;
-		}
-		result = i2c_write_read(data->i2c_bus, ST25DV_SYSTEM_AREA_ADDR,
-					(uint8_t[]){
-						(uint8_t)(ST25DV_REG_SYS_MEM_SIZE_MSB >> 8),
-						(uint8_t)ST25DV_REG_SYS_MEM_SIZE_MSB,
-					},
-					2, &mem_size_msb, sizeof(mem_size_msb));
-		if (result) {
-			LOG_ERR("%s read memory size msb failed %d", st25dv_module_name, result);
-			break;
-		}
-		result = ((((size_t)mem_size_msb << 8) | (mem_size_lsb)) + 1) << 2;
-		LOG_INF("%s memory size %u bytes", st25dv_module_name, result);
 	} while (0);
 
 	return result;
@@ -783,7 +731,8 @@ static inline int st25dv_reset(struct st25dv_data *data)
 	return result;
 }
 
-static inline int st25dv_type5_tag_precondition(struct st25dv_data *data)
+static inline int st25dv_type5_tag_precondition(struct st25dv_data *data, size_t *mem_len,
+						size_t *tag_len)
 {
 	int result = -ENODEV;
 
@@ -802,6 +751,66 @@ static inline int st25dv_type5_tag_precondition(struct st25dv_data *data)
 			LOG_ERR("%s not detected on i2c bus %d", st25dv_module_name, result);
 			break;
 		}
+
+		uint8_t mem_size_lsb, mem_size_msb;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_SYSTEM_AREA_ADDR,
+					(uint8_t[]){
+						(uint8_t)(ST25DV_REG_SYS_MEM_SIZE_LSB >> 8),
+						(uint8_t)ST25DV_REG_SYS_MEM_SIZE_LSB,
+					},
+					2, &mem_size_lsb, sizeof(mem_size_lsb));
+		if (result) {
+			LOG_ERR("%s read memory size lsb failed %d", st25dv_module_name, result);
+			break;
+		}
+		result = i2c_write_read(data->i2c_bus, ST25DV_SYSTEM_AREA_ADDR,
+					(uint8_t[]){
+						(uint8_t)(ST25DV_REG_SYS_MEM_SIZE_MSB >> 8),
+						(uint8_t)ST25DV_REG_SYS_MEM_SIZE_MSB,
+					},
+					2, &mem_size_msb, sizeof(mem_size_msb));
+		if (result) {
+			LOG_ERR("%s read memory size msb failed %d", st25dv_module_name, result);
+			break;
+		}
+		*mem_len = ((((size_t)mem_size_msb << 8) | (mem_size_lsb)) + 1) << 2;
+		LOG_INF("%s memory size %u bytes", st25dv_module_name, *mem_len);
+
+		uint8_t header_len_data;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						0x00,
+						0x02,
+					},
+					2, /* zero 8 bytes CC , nonzero 4 bytes CC */
+					&header_len_data, sizeof(header_len_data));
+		if (result) {
+			LOG_ERR("%s read cc length failed %d", st25dv_module_name, result);
+			break;
+		}
+		*tag_len = !header_len_data ? 8 : 4;
+
+		uint8_t tag_len_data[3];
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						0x00,
+						(uint8_t)((*tag_len) + 1),
+					},
+					2, /* tlv starts at cc length, so tlv length at offset 1 */
+					tag_len_data, sizeof(tag_len_data));
+		if (result) {
+			LOG_ERR("%s read tag length failed %d", st25dv_module_name, result);
+			break;
+		}
+		*tag_len += tag_len_data[0] == 0xff ? 4 : 2; /* tag and length */
+		*tag_len += tag_len_data[0] == 0xff
+				    ? ((size_t)(tag_len_data[1] << 8) | tag_len_data[2])
+				    : tag_len_data[0];
+		*tag_len = MIN(*tag_len, *mem_len); /* probably malformed tag data */
+		LOG_INF("%s tag size %u bytes", st25dv_module_name, *tag_len);
 	} while (0);
 
 	return result;
