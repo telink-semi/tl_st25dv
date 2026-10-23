@@ -50,9 +50,11 @@ static inline int st25dv_update_registers(struct st25dv_data *data);
 static inline int st25dv_reset(struct st25dv_data *data);
 static inline int st25dv_type5_tag_precondition(struct st25dv_data *data, size_t *mem_len,
 						size_t *tag_len);
+static inline int st25dv_mode_get_internal(struct st25dv_data *data);
+static inline int st25dv_mode_set_internal(struct st25dv_data *data, enum st25dv_mode mode);
 static void st25dv_isr_handler(const struct device *port, struct gpio_callback *cb,
 			       gpio_port_pins_t pins);
-static void st25dv_work_handler(struct k_work *item);
+static void st25dv_isr_work_handler(struct k_work *item);
 
 int st25dv_probe(struct st25dv_data *data)
 {
@@ -142,9 +144,9 @@ int st25dv_init(struct st25dv_data *data)
 			LOG_ERR("%s reset failed %d", st25dv_module_name, result);
 			break;
 		}
-		data->data_sent = NULL;
-		data->data_received = NULL;
-		k_work_init(&data->work, st25dv_work_handler);
+		data->event_handler = NULL;
+		data->event_ctx = NULL;
+		k_work_init(&data->isr_work, st25dv_isr_work_handler);
 		result = gpio_pin_configure(data->isr_port, data->isr_port_pin,
 					    GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
 		if (result) {
@@ -161,17 +163,6 @@ int st25dv_init(struct st25dv_data *data)
 						      GPIO_INT_EDGE_TO_ACTIVE);
 		if (result) {
 			LOG_ERR("%s gpio isr setup failed %d", st25dv_module_name, result);
-			break;
-		}
-		result = i2c_write(data->i2c_bus,
-				   (uint8_t[]){
-					   (uint8_t)(ST25DV_REG_USR_MB_CTRL_DYN >> 8),
-					   (uint8_t)ST25DV_REG_USR_MB_CTRL_DYN,
-					   0x01, /* bit 0: MB_EN = 1 */
-				   },
-				   3, ST25DV_USER_MEMORY_ADDR);
-		if (result) {
-			LOG_ERR("%s enable mailbox failed %d", st25dv_module_name, result);
 			break;
 		}
 		result = i2c_write(data->i2c_bus,
@@ -230,13 +221,57 @@ int st25dv_deinit(struct st25dv_data *data)
 
 		struct k_work_sync sync_handle;
 
-		(void)k_work_cancel_sync(&data->work, &sync_handle);
+		(void)k_work_cancel_sync(&data->isr_work, &sync_handle);
 		data->inited = false;
 		LOG_DBG("%s deinit ok", st25dv_module_name);
 	} while (0);
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
 		((void)k_mutex_unlock(&data->protector);)
 	)
+	return result;
+}
+
+int st25dv_mode_get(struct st25dv_data *data)
+{
+	int result = -ENODEV;
+
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_lock(&data->protector, K_FOREVER);)
+	)
+	do {
+		LOG_DBG("%s %s", st25dv_module_name, __func__);
+		if (!data->inited) {
+			LOG_DBG("%s not inited", st25dv_module_name);
+			break;
+		}
+		result = st25dv_mode_get_internal(data);
+	} while (0);
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_unlock(&data->protector);)
+	)
+
+	return result;
+}
+
+int st25dv_mode_set(struct st25dv_data *data, enum st25dv_mode mode)
+{
+	int result = -ENODEV;
+
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_lock(&data->protector, K_FOREVER);)
+	)
+	do {
+		LOG_DBG("%s %s", st25dv_module_name, __func__);
+		if (!data->inited) {
+			LOG_DBG("%s not inited", st25dv_module_name);
+			break;
+		}
+		result = st25dv_mode_set_internal(data, mode);
+	} while (0);
+	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
+		((void)k_mutex_unlock(&data->protector);)
+	)
+
 	return result;
 }
 
@@ -301,21 +336,20 @@ int st25dv_mailbox_send(struct st25dv_data *data, const void *buf, size_t buf_le
 	return result;
 }
 
-void st25dv_set_callbacks(struct st25dv_data *data, st25dv_on_data_sent tx_cb,
-			  st25dv_on_data_received rx_cb)
+void st25dv_set_callback(struct st25dv_data *data, st25dv_on_event event_handler, void *ctx)
 {
 	LOG_DBG("%s %s", st25dv_module_name, __func__);
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
 		((void)k_mutex_lock(&data->protector, K_FOREVER);)
 	)
-	data->data_sent = tx_cb;
-	data->data_received = rx_cb;
+	data->event_handler = event_handler;
+	data->event_ctx = ctx;
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
 		((void)k_mutex_unlock(&data->protector);)
 	)
 }
 
-int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_len)
+int st25dv_tag_type5_add(struct st25dv_data *data, const void *buf, size_t buf_len)
 {
 	int result = -EINVAL;
 
@@ -340,7 +374,7 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 		uint8_t header[12];
 		size_t header_len;
 
-		if (result > 2044) {
+		if (mem_size > 2044) {
 			header[0] = 0xe2;                                 /* magic number     */
 			header[1] = 0x40;                                 /* version & access */
 			header[2] = 0x00;                                 /* zero             */
@@ -376,6 +410,14 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 			break;
 		}
 
+		enum st25dv_mode mode_bkp = st25dv_mode_get_internal(data);
+
+		result = st25dv_mode_set_internal(data, ST25DV_MODE_TAG);
+		if (result) {
+			LOG_ERR("%s mode tag set failed %d", st25dv_module_name, result);
+			break;
+		}
+
 		size_t addr = 0;
 
 		while (buf_len) {
@@ -403,10 +445,7 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 			buf = (uint8_t *)buf + wr_len;
 			addr += 128;
 		}
-		if (result) {
-			break;
-		}
-		while (addr < tag_size) {
+		while (!buf_len && addr < tag_size) {
 
 			uint8_t wr_buff[2 + 128];
 
@@ -422,7 +461,12 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS * 128 / ST25DV_FLASH_BLOCK_SIZE);
 			addr += 128;
 		}
+		result = st25dv_mode_set_internal(data, mode_bkp);
 		if (result) {
+			LOG_ERR("%s mode restore failed %d", st25dv_module_name, result);
+			break;
+		}
+		if (buf_len || addr < tag_size) {
 			break;
 		}
 		LOG_DBG("%s tag wtite ok", st25dv_module_name);
@@ -433,7 +477,7 @@ int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_l
 	return result;
 }
 
-int st25dv_type5_tag_rm(struct st25dv_data *data)
+int st25dv_tag_type5_rm(struct st25dv_data *data)
 {
 	int result;
 
@@ -448,6 +492,14 @@ int st25dv_type5_tag_rm(struct st25dv_data *data)
 		result = st25dv_type5_tag_precondition(data, &mem_size, &tag_size);
 		if (result) {
 			LOG_ERR("%s tag preconditions failed %d", st25dv_module_name, result);
+			break;
+		}
+
+		enum st25dv_mode mode_bkp = st25dv_mode_get_internal(data);
+
+		result = st25dv_mode_set_internal(data, ST25DV_MODE_TAG);
+		if (result) {
+			LOG_ERR("%s mode tag set failed %d", st25dv_module_name, result);
 			break;
 		}
 
@@ -469,54 +521,15 @@ int st25dv_type5_tag_rm(struct st25dv_data *data)
 			k_msleep(ST25DV_FLASH_UPDATE_TIME_MS * 128 / ST25DV_FLASH_BLOCK_SIZE);
 			addr += 128;
 		}
+		result = st25dv_mode_set_internal(data, mode_bkp);
 		if (result) {
+			LOG_ERR("%s mode restore failed %d", st25dv_module_name, result);
+			break;
+		}
+		if (addr < tag_size) {
 			break;
 		}
 		LOG_DBG("%s tag erase ok", st25dv_module_name);
-	} while (0);
-	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
-		((void)k_mutex_unlock(&data->protector);)
-	)
-	return result;
-}
-
-int st25dv_type5_tag_enable(struct st25dv_data *data, bool enable)
-{
-	int result = -ENODEV;
-
-	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
-		((void)k_mutex_lock(&data->protector, K_FOREVER);)
-	)
-	do {
-		LOG_DBG("%s %s", st25dv_module_name, __func__);
-		if (data->inited) {
-			LOG_ERR("%s mailbox mode active", st25dv_module_name);
-			break;
-		}
-		if (!device_is_ready(data->i2c_bus)) {
-			LOG_ERR("%s device %s not ready", st25dv_module_name, data->i2c_bus->name);
-			break;
-		}
-		result = st25dv_probe_internal(data);
-		if (result) {
-			LOG_ERR("%s not detected on i2c bus %d", st25dv_module_name, result);
-			break;
-		}
-		result = i2c_write(data->i2c_bus,
-				   (uint8_t[]){
-					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
-					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
-					   enable ? 0x00 : 0x02, /* bit 0: RF_DISABLE = 1
-								  * bit 1: RF_SLEEP = 1,
-								  * bit 2: RF_OFF = 1
-								  */
-				   },
-				   3, ST25DV_USER_MEMORY_ADDR);
-		if (result) {
-			LOG_ERR("%s reset radio state failed %d", st25dv_module_name, result);
-			break;
-		}
-		LOG_DBG("%s tag %s", st25dv_module_name, enable ? "enabled" : "disabled");
 	} while (0);
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
 		((void)k_mutex_unlock(&data->protector);)
@@ -651,7 +664,8 @@ static inline int st25dv_update_registers(struct st25dv_data *data)
 			LOG_ERR("%s gpo 1 read failed %d", st25dv_module_name, result);
 			break;
 		}
-		if (gpo_1 == 0x61) { /* bit 0: GPO_EN = 1,
+		if (gpo_1 == 0x71) { /* bit 0: GPO_EN = 1,
+				      * bit 4: FIELD_CHANGE_EN = 1,
 				      * bit 5: RF_PUT_MSG_EN = 1,
 				      * bit 6: RF_GET_MSG_EN = 1
 				      */
@@ -662,8 +676,9 @@ static inline int st25dv_update_registers(struct st25dv_data *data)
 				   (uint8_t[]){
 					   (uint8_t)(ST25DV_REG_SYS_GPO_1 >> 8),
 					   (uint8_t)ST25DV_REG_SYS_GPO_1,
-					   0x61,
+					   0x71,
 					   /* bit 0: GPO_EN = 1,
+					    * bit 4: FIELD_CHANGE_EN = 1,
 					    * bit 5: RF_PUT_MSG_EN = 1,
 					    * bit 6: RF_GET_MSG_EN = 1,
 					    */
@@ -786,10 +801,7 @@ static inline int st25dv_reset(struct st25dv_data *data)
 				   (uint8_t[]){
 					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
 					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
-					   0x00, /* bit 0: RF_DISABLE = 1
-						  * bit 1: RF_SLEEP = 1,
-						  * bit 2: RF_OFF = 1
-						  */
+					   0x02, /* bit 1: RF_SLEEP = 1 */
 				   },
 				   3, ST25DV_USER_MEMORY_ADDR);
 		if (result) {
@@ -830,17 +842,8 @@ static inline int st25dv_type5_tag_precondition(struct st25dv_data *data, size_t
 
 	do {
 		LOG_DBG("%s %s", st25dv_module_name, __func__);
-		if (data->inited) {
+		if (!data->inited) {
 			LOG_ERR("%s mailbox mode active", st25dv_module_name);
-			break;
-		}
-		if (!device_is_ready(data->i2c_bus)) {
-			LOG_ERR("%s device %s not ready", st25dv_module_name, data->i2c_bus->name);
-			break;
-		}
-		result = st25dv_probe_internal(data);
-		if (result) {
-			LOG_ERR("%s not detected on i2c bus %d", st25dv_module_name, result);
 			break;
 		}
 
@@ -908,18 +911,146 @@ static inline int st25dv_type5_tag_precondition(struct st25dv_data *data, size_t
 	return result;
 }
 
+static inline int st25dv_mode_get_internal(struct st25dv_data *data)
+{
+	int result;
+
+	do {
+		LOG_DBG("%s %s", st25dv_module_name, __func__);
+
+		uint8_t radio_state;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						(uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+						(uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					},
+					2, &radio_state, sizeof(radio_state));
+		if (result) {
+			LOG_ERR("%s radio state read failed %d", st25dv_module_name, result);
+			break;
+		}
+		if (radio_state & 0x02) { /* bit 1: RF_SLEEP = 1 */
+			result = ST25DV_MODE_OFF;
+			break;
+		}
+
+		uint8_t ctrl_reg;
+
+		result = i2c_write_read(data->i2c_bus, ST25DV_USER_MEMORY_ADDR,
+					(uint8_t[]){
+						(uint8_t)(ST25DV_REG_USR_MB_CTRL_DYN >> 8),
+						(uint8_t)ST25DV_REG_USR_MB_CTRL_DYN,
+					},
+					2, &ctrl_reg, sizeof(ctrl_reg));
+		if (result) {
+			LOG_ERR("%s mailbox status failed %d", st25dv_module_name, result);
+			break;
+		}
+		if (ctrl_reg & 0x01) { /* bit 0: MB_EN = 1 */
+			result = ST25DV_MODE_MAILBOX;
+			break;
+		}
+		result = ST25DV_MODE_TAG;
+	} while (0);
+
+	return result;
+}
+
+static inline int st25dv_mode_set_internal(struct st25dv_data *data, enum st25dv_mode mode)
+{
+	int result = -EINVAL;
+
+	LOG_DBG("%s %s", st25dv_module_name, __func__);
+	switch (mode) {
+	case ST25DV_MODE_OFF:
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					   0x02, /* bit 1: RF_SLEEP = 1 */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s disable radio failed %d", st25dv_module_name, result);
+			break;
+		}
+		LOG_DBG("%s mode off", st25dv_module_name);
+		break;
+	case ST25DV_MODE_TAG:
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					   0x00, /* bit 1: RF_SLEEP = 1 */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s enable radio failed %d", st25dv_module_name, result);
+			break;
+		}
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_MB_CTRL_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_MB_CTRL_DYN,
+					   0x00, /* bit 0: MB_EN = 1 */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s disable mailbox failed %d", st25dv_module_name, result);
+			break;
+		}
+		LOG_DBG("%s mode tag", st25dv_module_name);
+		break;
+	case ST25DV_MODE_MAILBOX:
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_RF_MNGT_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_RF_MNGT_DYN,
+					   0x00, /* bit 1: RF_SLEEP = 1 */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s enable radio failed %d", st25dv_module_name, result);
+			break;
+		}
+		result = i2c_write(data->i2c_bus,
+				   (uint8_t[]){
+					   (uint8_t)(ST25DV_REG_USR_MB_CTRL_DYN >> 8),
+					   (uint8_t)ST25DV_REG_USR_MB_CTRL_DYN,
+					   0x01, /* bit 0: MB_EN = 1 */
+				   },
+				   3, ST25DV_USER_MEMORY_ADDR);
+		if (result) {
+			LOG_ERR("%s enable mailbox failed %d", st25dv_module_name, result);
+			break;
+		}
+		LOG_DBG("%s mode mailbox", st25dv_module_name);
+		break;
+	default:
+		LOG_ERR("%s invalid mode %u", st25dv_module_name, mode);
+	}
+
+	return result;
+}
+
 static void st25dv_isr_handler(const struct device *port, struct gpio_callback *cb,
 			       gpio_port_pins_t pins)
 {
 	struct st25dv_data *data = CONTAINER_OF(cb, struct st25dv_data, gpio_cb);
 
 	/* LOG_DBG("%s %s", st25dv_module_name, __func__); */
-	k_work_submit_to_queue(&st25dv_workq, &data->work);
+
+	int result = k_work_submit_to_queue(&st25dv_workq, &data->isr_work);
+
+	if (result < 0) {
+		LOG_ERR("%s failed to submit isr work %d", st25dv_module_name, result);
+	}
 }
 
-static void st25dv_work_handler(struct k_work *item)
+static void st25dv_isr_work_handler(struct k_work *item)
 {
-	struct st25dv_data *data = CONTAINER_OF(item, struct st25dv_data, work);
+	struct st25dv_data *data = CONTAINER_OF(item, struct st25dv_data, isr_work);
 	int result = 0;
 	uint8_t it_status;
 
@@ -941,10 +1072,26 @@ static void st25dv_work_handler(struct k_work *item)
 		break;
 	}
 
+	while (!result && it_status & 0x08) { /* bit 3: FIELD_FALLING = 1 */
+		LOG_DBG("%s rf field falling", st25dv_module_name);
+		if (data->event_handler) {
+			data->event_handler(ST25DV_EVENT_FIELD_OFF, data->event_ctx, NULL, 0);
+		}
+		break;
+	}
+
+	while (!result && it_status & 0x10) { /* bit 4: FIELD_RISING = 1 */
+		LOG_DBG("%s rf field rising", st25dv_module_name);
+		if (data->event_handler) {
+			data->event_handler(ST25DV_EVENT_FIELD_ON, data->event_ctx, NULL, 0);
+		}
+		break;
+	}
+
 	while (!result && it_status & 0x40) { /* bit 6: RF_GET_MSG = 1 */
 		LOG_DBG("%s data sent", st25dv_module_name);
-		if (data->data_sent) {
-			data->data_sent(data);
+		if (data->event_handler) {
+			data->event_handler(ST25DV_EVENT_DATA_SENT, data->event_ctx, NULL, 0);
 		}
 		break;
 	}
@@ -979,13 +1126,14 @@ static void st25dv_work_handler(struct k_work *item)
 			break;
 		}
 		LOG_HEXDUMP_DBG(mbox_data, sizeof(mbox_data), st25dv_module_name);
-		if (data->data_received) {
-			data->data_received(data, mbox_data, sizeof(mbox_data));
+		if (data->event_handler) {
+			data->event_handler(ST25DV_EVENT_DATA_RECEIVED, data->event_ctx, mbox_data,
+					    sizeof(mbox_data));
 		}
 		break;
 	}
 
-	while (!result && it_status & 0x9F) { /* other interrupts */
+	while (!result && it_status & 0x87) { /* other interrupts */
 		LOG_WRN("%s unhandled interrupt %02x", st25dv_module_name, it_status & 0x9F);
 		break;
 	}
