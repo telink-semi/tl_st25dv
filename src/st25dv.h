@@ -16,9 +16,20 @@
 
 struct st25dv_data;
 
-typedef void (*st25dv_on_data_sent)(struct st25dv_data *data);
-typedef void (*st25dv_on_data_received)(struct st25dv_data *data, const uint8_t *buffer,
-					size_t len);
+enum st25dv_mode {
+	ST25DV_MODE_OFF,
+	ST25DV_MODE_TAG,
+	ST25DV_MODE_MAILBOX,
+};
+
+enum st25dv_event {
+	ST25DV_EVENT_FIELD_ON,
+	ST25DV_EVENT_FIELD_OFF,
+	ST25DV_EVENT_DATA_RECEIVED,
+	ST25DV_EVENT_DATA_SENT,
+};
+
+typedef void (*st25dv_on_event)(enum st25dv_event event, void *ctx, uint8_t *buf, size_t buf_len);
 
 struct st25dv_data {
 	const struct device *const i2c_bus;
@@ -26,9 +37,9 @@ struct st25dv_data {
 	const uint8_t isr_port_pin;
 	bool inited;
 	struct gpio_callback gpio_cb;
-	struct k_work work;
-	st25dv_on_data_sent data_sent;
-	st25dv_on_data_received data_received;
+	struct k_work isr_work;
+	st25dv_on_event event_handler;
+	void *event_ctx;
 	IF_ENABLED(CONFIG_ST25DV_MULTITHREAD_SUPPORT,
 		(struct k_mutex protector;)
 	)
@@ -47,11 +58,11 @@ int st25dv_probe(struct st25dv_data *data);
 int st25dv_unlock(struct st25dv_data *data, const uint8_t pass[8]);
 int st25dv_init(struct st25dv_data *data);
 int st25dv_deinit(struct st25dv_data *data);
+int st25dv_mode_get(struct st25dv_data *data);
+int st25dv_mode_set(struct st25dv_data *data, enum st25dv_mode mode);
 int st25dv_mailbox_send(struct st25dv_data *data, const void *buf, size_t buf_len);
-void st25dv_set_callbacks(struct st25dv_data *data, st25dv_on_data_sent tx_cb,
-			  st25dv_on_data_received rx_cb);
-int st25dv_type5_tag_add(struct st25dv_data *data, const void *buf, size_t buf_len);
-int st25dv_type5_tag_rm(struct st25dv_data *data);
-int st25dv_type5_tag_enable(struct st25dv_data *data, bool enable);
+void st25dv_set_callback(struct st25dv_data *data, st25dv_on_event event_handler, void *ctx);
+int st25dv_tag_type5_add(struct st25dv_data *data, const void *buf, size_t buf_len);
+int st25dv_tag_type5_rm(struct st25dv_data *data);
 
 #endif /* ST25DV_H */
